@@ -1,0 +1,156 @@
+(*** Short protocol description ***
+
+Initiator Alice (A)
+Responder Bob (B)
+
+Alice sends a message to Bob, who turns out to be a spy. He publishes
+the message, so it is no longer a secret. However, he should not be
+able to prove to anyone else that it was Alice who sent the message
+and not himself posing as Alice. In other words, Alice should be able
+to repudiate the message.
+
+To prove this in Proverif, we model to processes: one where Alice
+does send a message to Bob, which Bob then publishes, and one where
+Bob publishes a fake message from Alice. For repudiability, the messages
+should be indistinguishable.
+
+A      : (key, nonce) = split(ksnd)
+         isnd_pub = isnd & 0xFFFF
+         ct = (isnd_pub, {(msg, MAC((nonce, isnd, msg), key)), nonce})
+A  -> B: ct
+      B: (key, nonce) = split(krcv)
+         ircv_pub = ircv & 0xFFFF
+         fakect = (ircv_pub, {(fakemsg, MAC((nonce, isnd, msg), key)), nonce})
+B ->   : krcv, ircv, choice[ct, fakect]
+
+*)
+
+
+(*** Types ***)
+
+type mac_key.
+type secret_key.
+type nonce.
+type point.
+type scalar.
+type identity.
+
+fun mk2bs(mac_key)    : bitstring       [data, typeConverter].
+fun bs2mk(bitstring)  : mac_key         [data, typeConverter].
+fun sk2bs(secret_key) : bitstring       [data, typeConverter].
+fun bs2sk(bitstring)  : secret_key      [data, typeConverter].
+fun pt2bs(point)      : bitstring       [data, typeConverter].
+fun bs2n (bitstring)  : nonce           [data, typeConverter].
+fun sk2mk(secret_key) : mac_key         [data, typeConverter].
+fun mk2sk(mac_key)    : secret_key      [data, typeConverter].
+
+
+(*** Functions ***)
+
+fun increment(bitstring) : bitstring [data].
+
+fun splitFst(bitstring) : bitstring.
+fun splitSnd(bitstring) : bitstring.
+reduc forall x:bitstring;
+      unsplit(splitFst(x), splitSnd(x)) = x.
+
+fun getCS(identity, identity) : bitstring [private].
+equation forall x:identity, y:identity;
+         getCS(x, y) = getCS(y, x).
+
+
+(* Cryptographic functions *)
+
+fun hash(bitstring) : bitstring.
+
+(* Message authentication code (MAC) *)
+fun mac(mac_key, bitstring) : bitstring.
+
+(* Key derivation function (KDF) *)
+reduc forall key:mac_key, context:bitstring, label:bitstring;
+      kdf(key, label, context) = mac(key, (label, context)).
+
+(* Symmetric encryption/decryption *)
+fun sym_enc(secret_key, nonce, bitstring) : bitstring.
+fun sym_dec(secret_key, nonce, bitstring) : bitstring.
+equation forall k:secret_key, n:nonce, m:bitstring;
+         sym_dec(k, n, sym_enc(k, n, m)) = m.
+equation forall k:secret_key, n:nonce, m:bitstring;
+         sym_enc(k, n, sym_dec(k, n, m)) = m.
+
+(* Authenticated Encryption with Additional Data *)
+letfun aead_enc(k:secret_key, n:nonce, header:bitstring, plaintext:bitstring) =
+       let tag = mac(sk2mk(k), (n, header, plaintext)) in
+       sym_enc(k, n, (plaintext, tag)).
+letfun aead_dec(k:secret_key, n:nonce, header:bitstring, ciphertext:bitstring) =
+       let (plaintext:bitstring, tag:bitstring) = sym_dec(k, n, ciphertext) in
+       let (=tag) = mac(sk2mk(k), (n, header, plaintext)) in
+       plaintext.
+
+
+(* Diffie-Hellman-Merkle key exchange
+ * Proverif does not care about the underlying group, so there is no need to
+ * encode ECDH any different.
+ *)
+const Base : point [data].
+fun mult(scalar, point) : point.
+
+equation forall x:scalar, y:scalar;
+         mult(x, mult(y, Base)) = mult(y, mult(x, Base)).
+
+
+(*** Communication channels ***)
+
+(* Public channel over which the protocol is executed. Usually the internet. *)
+free ch:channel.
+
+(*** Queries ***)
+
+(* Key material (established at key negotiation) *)
+free kAB : bitstring [private].
+free iAtoB : bitstring. (* Assumed public *)
+
+(*** Processes ***)
+
+(* Process for the (honest) sender of the message *)
+let processSender(ksnd:bitstring, isnd:bitstring) =
+  (* create new message *)
+  new msg : bitstring;
+  (* create ciphertext *) 
+  let key = bs2sk(splitFst(ksnd)) in
+  let n = bs2n(splitSnd(ksnd)) in
+  let ct = aead_enc(key, n, isnd, msg) in 
+  (* send the ciphertext *)
+  let isnd_pub = splitSnd(isnd) in
+  out(ch, (isnd_pub, ct)).
+
+(* Process for the (dishonest) receiver, posing as sender of the message *)
+let processFakeSender(krcv:bitstring, ircv:bitstring) =
+  (* create new message *)
+  new fakemsg : bitstring;
+  (* create ciphertext *) 
+  let key = bs2sk(splitFst(krcv)) in
+  let n = bs2n(splitSnd(krcv)) in
+  let fakect = aead_enc(key, n, ircv, fakemsg) in 
+  (* send the ciphertext *)
+  let isnd_pub = splitSnd(ircv) in
+  out(ch, (isnd_pub, fakect)).
+
+(* Process for the (dishonest) receiver, revealing the message *)
+let processReceiverReveal(krcv:bitstring, ircv:bitstring) =
+  (* prepare key material *)
+  let ircv_pub = splitSnd(ircv) in
+  (* receive message *)
+  in(ch, (=ircv_pub, ct:bitstring));
+  (* reveal the message, by publishing the keys *)
+  out(ch, (krcv, ircv)).
+
+(*** Main ***)
+
+equivalence
+  ! in(ch, (k:bitstring, i:bitstring)); 
+    processSender(k, i) |
+    processReceiverReveal(k, i)
+  ! in(ch, (k:bitstring, i:bitstring));
+    processFakeSender(k, i) |
+    processReceiverReveal(k, i)

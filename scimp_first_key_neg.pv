@@ -1,0 +1,331 @@
+(*
+
+Formal analysis of the Silent Cirlce Instant Messaging Protocol (SCIMP).
+
+Author:        Sebastian Verschoor
+Email:         s.r.verschoor@student.tue.nl
+Last modified: <2015-10-08 16:04:32>
+
+This file checks the secrecy and authenticity of the initial key negotiation,
+where two honest participants do not yet share a cached secret.
+
+The description for the protocol was taken from the protocol description at:
+https://github.com/SilentCircle/silent-text/tree/master/Documentation
+A more informal description is given at:
+https://silentcircle.com/scimp-protocol
+
+Proverif version used: 1.90 (retrieved at 2015-07-06)
+
+*** Short protocol description ***
+
+Initiator Alice (A)
+Responder Bob (B)
+ECDHE-exchange using a fixed base point G
+
+      A: skI    := random()
+         pkI    := skI * G
+A  -> B: commit  = (#pkI, MAC(NULL, (#pkI, "Initiator")))
+      B: skR    := random()
+         pkR    := skR * G
+B  -> A: dh1     = (pkR, MAC(NULL, (#pkR, "Responder")))
+      A: kdk2   := MAC(MAC(htotal, Z), (CONSTS, context, NULL))
+                   where htotal  = #(commit, dh1, pkI)
+                         Z       = skI * pkR
+                         context = (A, B, htotal)
+         extract from kdk2 and session variables:
+           ksnd, krcv, maci, macr, sasi, cs1, isnd, ircv
+A  -> B: dh2     = (pkI, maci)
+      B: validate pkI with #pkI of commit; or abort
+         kdk2   := MAC(MAC(htotal, Z), (CONSTS, context, NULL))
+                   where htotal  = #(commit, dh1, pkI)
+                         Z       = skR * pkI
+                         context = (A, B, htotal)
+         extract from kdk2 and session variables:
+           krcv, ksnd, macr, maci, sasr, cs1, ircv, isnd
+B  -> A: commit  = macr
+
+A <=> B: check (sasi = sasr); or abort
+
+*)
+
+
+(*** Types ***)
+
+type mac_key.
+type secret_key.
+type nonce.
+type point.
+type scalar.
+type identity.
+
+fun mk2bs(mac_key)    : bitstring       [data, typeConverter].
+fun bs2mk(bitstring)  : mac_key         [data, typeConverter].
+fun sk2bs(secret_key) : bitstring       [data, typeConverter].
+fun bs2sk(bitstring)  : secret_key      [data, typeConverter].
+fun pt2bs(point)      : bitstring       [data, typeConverter].
+fun bs2n (bitstring)  : nonce           [data, typeConverter].
+fun sk2mk(secret_key) : mac_key         [data, typeConverter].
+fun mk2sk(mac_key)    : secret_key      [data, typeConverter].
+
+
+(*** Functions ***)
+
+fun increment(bitstring) : bitstring [data].
+
+fun splitFst(bitstring) : bitstring.
+fun splitSnd(bitstring) : bitstring.
+reduc forall x:bitstring;
+      unsplit(splitFst(x), splitSnd(x)) = x.
+
+(* Cryptographic functions *)
+
+fun hash(bitstring) : bitstring.
+
+(* Message authentication code (MAC) *)
+fun mac(mac_key, bitstring) : bitstring.
+
+(* Key derivation function (KDF) *)
+reduc forall key:mac_key, context:bitstring, label:bitstring;
+      kdf(key, label, context) = mac(key, (label, context)).
+
+(* Symmetric encryption/decryption *)
+fun sym_enc(secret_key, nonce, bitstring) : bitstring.
+fun sym_dec(secret_key, nonce, bitstring) : bitstring.
+equation forall k:secret_key, n:nonce, m:bitstring;
+         sym_dec(k, n, sym_enc(k, n, m)) = m.
+equation forall k:secret_key, n:nonce, m:bitstring;
+         sym_enc(k, n, sym_dec(k, n, m)) = m.
+
+(* Authenticated Encryption with Additional Data *)
+letfun aead_enc(k:secret_key, n:nonce, header:bitstring, plaintext:bitstring) =
+       let tag = mac(sk2mk(k), (n, header, plaintext)) in
+       sym_enc(k, n, (plaintext, tag)).
+letfun aead_dec(k:secret_key, n:nonce, header:bitstring, ciphertext:bitstring) =
+       let (plaintext:bitstring, tag:bitstring) = sym_dec(k, n, ciphertext) in
+       let (=tag) = mac(sk2mk(k), (n, header, plaintext)) in
+       plaintext.
+
+
+(* Diffie-Hellman-Merkle key exchange
+ * Proverif does not care about the underlying group, so there is no need to
+ * encode ECDH any different.
+ *)
+const Base : point [data].
+fun mult(scalar, point) : point.
+
+equation forall x:scalar, y:scalar;
+         mult(x, mult(y, Base)) = mult(y, mult(x, Base)).
+
+
+(*** Communication channels ***)
+
+(* Public channel over which the protocol is executed. Usually the internet. *)
+free ch:channel.
+
+(*** Constants ***)
+
+const Null            : bitstring [data]. (* NULL *)
+const OK              : bitstring [data]. (* Confirmation of SAS *)
+
+(* String constants *)
+const InitStr         : bitstring [data]. (* "Initiator" *)
+const RespStr         : bitstring [data]. (* "Responder" *)
+const MasterStr       : bitstring [data]. (* "MasterSecret" *)
+const AlgId           : bitstring [data]. (* "SCimp-ENHANCE" *)
+
+(* Labels for key derivation *)
+const InitMasterLabel : bitstring [data]. (* "InitiatorMasterKey" *)
+const RespMasterLabel : bitstring [data]. (* "ResponderMasterKey" *)
+const InitMACLabel    : bitstring [data]. (* "InitiatorMACkey" *)
+const RespMACLabel    : bitstring [data]. (* "ResponderMACkey" *)
+const SasLabel        : bitstring [data]. (* "SAS" *)
+const CsLabel         : bitstring [data]. (* "RetainedSecret" *)
+const InitIndexLabel  : bitstring [data]. (* "InitiatorInitialIndex" *)
+const RespIndexLabel  : bitstring [data]. (* "ResponderInitialIndex" *)
+const MsgKeyLabel     : bitstring [data]. (* "MessageKey" *)
+
+(* Identity of an adversary *)
+const Compromised : identity [data].
+
+
+(*** Queries ***)
+
+(* Queries for confidentiality *)
+free ksndInitFlag, krcvInitFlag, isndInitFlag, ircvInitFlag,
+     ksndRespFlag, krcvRespFlag, isndRespFlag, ircvRespFlag,
+     cs1InitFlag, cs1RespFlag : bitstring [private].
+
+query attacker(ksndInitFlag); attacker(krcvInitFlag);
+      attacker(isndInitFlag); attacker(ircvInitFlag);
+      attacker(ksndRespFlag); attacker(krcvRespFlag);
+      attacker(isndRespFlag); attacker(ircvRespFlag);
+      attacker(cs1InitFlag);  attacker(cs1RespFlag).
+
+(* Queries for authenticity *)
+event beginInit(identity, identity, bitstring, bitstring, bitstring, bitstring, bitstring).
+event acceptInit(identity, identity, bitstring, bitstring, bitstring, bitstring, bitstring).
+event beginResp(identity, identity, bitstring, bitstring, bitstring, bitstring, bitstring).
+event acceptResp(identity, identity, bitstring, bitstring, bitstring, bitstring, bitstring).
+
+query x:identity, y:identity, ki:bitstring, kr:bitstring,
+      ii:bitstring, ir:bitstring, cs:bitstring;
+      inj-event(acceptInit(x, y, ki, kr, ii, ir, cs))
+        ==> inj-event(beginInit(x, y, ki, kr, ii, ir, cs)).
+query x:identity, y:identity, ki:bitstring, kr:bitstring,
+      ii:bitstring, ir:bitstring, cs:bitstring;
+      inj-event(acceptResp(x, y, ki, kr, ii, ir, cs))
+        ==> inj-event(beginResp(x, y, ki, kr, ii, ir, cs)).
+
+
+(* Query reachability: check for typos. This should result in
+   not attacker(....HasTypo[]) is false. *)
+free initHasTypo, respHasTypo : bitstring [private].
+query attacker(initHasTypo); attacker(respHasTypo).
+
+
+(*** Processes ***)
+
+(* Role of the initiator *)
+let processInitiator(init:identity, resp:identity, phone:channel) =
+  (* Commit *)
+  new ski : scalar;
+  let pki    = mult(ski, Base) in
+  let hpki   = hash(pt2bs(pki)) in
+  let hcsi   = mac(bs2mk(Null), (hpki, InitStr)) in
+  let commit = (hpki, hcsi) in
+  out(ch, commit);
+
+  (* DH1 *)
+  in(ch, dh1:bitstring);
+  let (pkr:point, hcsr:bitstring) = dh1 in
+
+  (* DH2 *)
+  let z       = mult(ski, pkr) in
+  let htotal  = hash((commit, dh1, pki)) in
+  let kdk     = bs2mk(mac(bs2mk(htotal), pt2bs(z))) in
+  let context = (init, resp, htotal) in
+  let sessId  = hash((init, resp)) in
+  let kdk2    = bs2mk(mac(kdk, (MasterStr, AlgId, context, Null))) in
+  let maci    = kdf(kdk2, InitMACLabel,    context) in
+  out(ch, (pki, maci));
+
+  (* Confirm *)
+  in(ch, macr:bitstring);
+  let ksnd    = kdf(kdk2, InitMasterLabel, context) in
+  let krcv    = kdf(kdk2, RespMasterLabel, sessId) in
+  let sas     = kdf(kdk2, SasLabel,        context) in
+  let cs1     = kdf(kdk2, CsLabel,         context) in
+  let (=macr) = kdf(kdk2, RespMACLabel,    context) in
+  let isnd    = kdf(kdk2, InitIndexLabel,  sessId) in
+  let ircv    = kdf(kdk2, RespIndexLabel,  sessId) in
+  
+  (* Start verification of initiator identity *)
+  event beginInit(init, resp, ksnd, krcv, isnd, ircv, cs1);
+
+  (* Confirm the SAS *)
+  out(phone, sas);
+  in(phone, (=sas, ok:bitstring));
+
+  (* Check that the conversation was not with the Compromised party
+     (because then we would expect no security anyway) *)
+  if resp <> Compromised then
+
+  (* Accept the responder identity and corresponding key material *)
+  event acceptResp(init, resp, ksnd, krcv, isnd, ircv, cs1);
+
+  (* Publish secret values to test secrecy of generated key material *)
+  out(ch, sym_enc(bs2sk(ksnd), bs2n(Null), ksndInitFlag));
+  out(ch, sym_enc(bs2sk(krcv), bs2n(Null), krcvInitFlag));
+  out(ch, sym_enc(bs2sk(isnd), bs2n(Null), isndInitFlag));
+  out(ch, sym_enc(bs2sk(ircv), bs2n(Null), ircvInitFlag));
+  out(ch, sym_enc(bs2sk(cs1),  bs2n(Null), cs1InitFlag))
+
+  (* Check for typos *)
+  ; out(ch, initHasTypo)
+  
+  .
+
+
+(* Role of the responder *)
+let processResponder(init:identity, resp:identity, phone:channel) =
+  (* Commit *)
+  in(ch, commit:bitstring);
+  let (hpki:bitstring, hcsi:bitstring) = commit in
+
+  (* DH1 *)
+  new skr : scalar;
+  let pkr  = mult(skr, Base) in
+  let hpkr = hash(pt2bs(pkr)) in
+  let hcsr = mac(bs2mk(Null), (hpkr, RespStr)) in
+  let dh1  = (pkr, hcsr) in
+  out(ch, dh1);
+
+  (* DH2 *)
+  in(ch, (pki:point, maci:bitstring));
+  let (=hpki) = hash(pt2bs(pki)) in
+
+  (* Confirm *)
+  let z       = mult(skr, pki) in
+  let htotal  = hash((commit, dh1, pki)) in
+  let kdk     = bs2mk(mac(bs2mk(htotal), pt2bs(z))) in
+  let context = (init, resp, htotal) in
+  let sessId  = hash((init, resp)) in
+  let kdk2    = bs2mk(mac(kdk, (MasterStr, AlgId, context, Null))) in
+  let ksnd    = kdf(kdk2, RespMasterLabel, sessId) in
+  let krcv    = kdf(kdk2, InitMasterLabel, context) in
+  let sas     = kdf(kdk2, SasLabel,        context) in
+  let cs1     = kdf(kdk2, CsLabel,         context) in
+  let (=maci) = kdf(kdk2, InitMACLabel,    context) in
+  let macr    = kdf(kdk2, RespMACLabel,    context) in
+  let isnd    = kdf(kdk2, RespIndexLabel,  sessId) in
+  let ircv    = kdf(kdk2, InitIndexLabel,  sessId) in
+  out(ch, macr);
+
+  (* Start verification of the responder *)
+  event beginResp(init, resp, krcv, ksnd, ircv, isnd, cs1);
+
+  (* Confirm the SAS *)
+  in(phone, =sas);
+  out(phone, (sas, OK));
+
+  (* Check that the conversation was not with the Compromised party
+     (because then we would expect no security anyway) *)
+  if init <> Compromised then
+
+  (* Accept the initiator identity and corresponding key material *)
+  event acceptInit(init, resp, krcv, ksnd, ircv, isnd, cs1);
+
+  (* Publish secret values to test secrecy of generated key material *)
+  out(ch, sym_enc(bs2sk(ksnd), bs2n(Null), ksndRespFlag));
+  out(ch, sym_enc(bs2sk(krcv), bs2n(Null), krcvRespFlag));
+  out(ch, sym_enc(bs2sk(isnd), bs2n(Null), isndRespFlag));
+  out(ch, sym_enc(bs2sk(ircv), bs2n(Null), ircvRespFlag));
+  out(ch, sym_enc(bs2sk(cs1),  bs2n(Null), cs1RespFlag))
+
+  (* Check for typos *)
+  ; out(ch, respHasTypo)
+
+  .
+
+(*** Main ***)
+
+process
+  (* Allow arbitrary many protocol runs *)
+  !
+  (* Let the adversary decide who will engage in key negotation *)
+  in(ch, (init:identity, resp:identity));
+  (* Create a new phone channel *)
+  new phone : channel;
+  (* Allow eavesdropping on the phone channel *)
+  (! in(phone, x:bitstring); out(ch, x)) |
+
+  if init = Compromised then (
+    out(ch, phone);
+    processResponder(init, resp, phone)
+  ) else if resp = Compromised then (
+    out(ch, phone);
+    processInitiator(init, resp, phone)
+  ) else (
+    processInitiator(init, resp, phone) |
+    processResponder(init, resp, phone)
+  )
